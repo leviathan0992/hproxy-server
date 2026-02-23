@@ -7,12 +7,12 @@ This project provides a standard HTTP/1.1 `CONNECT` proxy server designed for se
 This tool is suitable for zero-trust network access, secure internal infrastructure exposure, or private tunneling requirements.
 
 ```
- --------------                                  -----------------
-|              |                                |                 |
-|  HTTP Client |       HTTPS (mTLS)             |  hproxy-server  |
-| (curl/Browser) --------------------------->  |                 |
-|              |                                |                 |
- --------------                                  -----------------
+ ----------------                                  -----------------
+|                |                                |                 |
+|  HTTP Client   |       HTTPS (mTLS)             |  hproxy-server  |
+| (curl/Browser) | --------------------------->   |                 |
+|                |                                |                 |
+ ----------------                                  -----------------
 ```
 
 ## Features
