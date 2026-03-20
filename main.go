@@ -24,6 +24,7 @@ type Config struct {
 	ServerPEM  string            `json:"server_pem"`
 	ServerKey  string            `json:"server_key"`
 	ClientPEM  string            `json:"client_pem"`
+	MTLS       *bool             `json:"mtls,omitempty"` // Use pointer to distinguish between false and missing
 	ListenAddr string            `json:"listen_addr"`
 	AuthUsers  map[string]string `json:"auth_users,omitempty"`
 }
@@ -32,14 +33,16 @@ type Server struct {
 	serverPEM string
 	serverKEY string
 	clientPEM string
+	mtls      bool
 	authUsers map[string]string
 }
 
-func NewServer(serverPEM string, serverKEY string, clientPEM string, authUsers map[string]string) *Server {
+func NewServer(serverPEM string, serverKEY string, clientPEM string, mtls bool, authUsers map[string]string) *Server {
 	return &Server{
 		serverPEM: serverPEM,
 		serverKEY: serverKEY,
 		clientPEM: clientPEM,
+		mtls:      mtls,
 		authUsers: authUsers,
 	}
 }
@@ -219,23 +222,30 @@ func (s *Server) ListenAndServe(addr string) error {
 		return errors.New("failed to load server certificate and key: " + err.Error())
 	}
 
-	certBytes, err := os.ReadFile(s.clientPEM)
-	if err != nil {
-		return errors.New("failed to read client CA file: " + err.Error())
-	}
-
-	clientCertPool := x509.NewCertPool()
-	if ok := clientCertPool.AppendCertsFromPEM(certBytes); !ok {
-		return errors.New("failed to parse client CA certificates")
-	}
-
 	tlsConfig := &tls.Config{
 		MinVersion:             tls.VersionTLS12,
 		Certificates:           []tls.Certificate{cert},
-		ClientAuth:             tls.RequireAndVerifyClientCert,
-		ClientCAs:              clientCertPool,
 		SessionTicketsDisabled: false,
 		ClientSessionCache:     tls.NewLRUClientSessionCache(128),
+	}
+
+	if s.mtls {
+		certBytes, err := os.ReadFile(s.clientPEM)
+		if err != nil {
+			return errors.New("failed to read client CA file: " + err.Error())
+		}
+
+		clientCertPool := x509.NewCertPool()
+		if ok := clientCertPool.AppendCertsFromPEM(certBytes); !ok {
+			return errors.New("failed to parse client CA certificates")
+		}
+
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsConfig.ClientCAs = clientCertPool
+		log.Printf("[SYSTEM] Server listening on %s (mTLS Enabled)", addr)
+	} else {
+		tlsConfig.ClientAuth = tls.NoClientCert
+		log.Printf("[SYSTEM] Server listening on %s (mTLS Disabled)", addr)
 	}
 
 	listener, err := tls.Listen("tcp", addr, tlsConfig)
@@ -295,7 +305,12 @@ func main() {
 		log.Fatalf("Failed to parse configuration file: %v", err)
 	}
 
-	s := NewServer(config.ServerPEM, config.ServerKey, config.ClientPEM, config.AuthUsers)
+	mtlsEnabled := true
+	if config.MTLS != nil {
+		mtlsEnabled = *config.MTLS
+	}
+
+	s := NewServer(config.ServerPEM, config.ServerKey, config.ClientPEM, mtlsEnabled, config.AuthUsers)
 
 	if err := s.ListenAndServe(config.ListenAddr); err != nil {
 		log.Fatalf("Server failed: %v", err)

@@ -3,6 +3,7 @@
     "server_pem": "server.crt",
     "server_key": "server.key",
     "client_pem": "client.pem",
+    "mtls": true,
     "auth_users": {
         "your-username": "your-secure-password"
     }
