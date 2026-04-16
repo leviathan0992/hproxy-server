@@ -15,16 +15,16 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type Config struct {
-	ServerPEM  string            `json:"server_pem"`
-	ServerKey  string            `json:"server_key"`
-	ClientPEM  string            `json:"client_pem"`
-	MTLS       *bool             `json:"mtls,omitempty"` // Use pointer to distinguish between false and missing
+	ServerPEM string `json:"server_pem"`
+	ServerKey string `json:"server_key"`
+	ClientPEM string `json:"client_pem"`
+	/* Use a pointer to distinguish between `false` and missing `mtls` field. */
+	MTLS       *bool             `json:"mtls,omitempty"`
 	ListenAddr string            `json:"listen_addr"`
 	AuthUsers  map[string]string `json:"auth_users,omitempty"`
 }
@@ -37,6 +37,24 @@ type Server struct {
 	authUsers map[string]string
 }
 
+const (
+	requestHeaderLimit   = 16 * 1024
+	handshakeTimeout     = 10 * time.Second
+	requestReadTimeout   = 5 * time.Second
+	responseWriteTimeout = 5 * time.Second
+	targetDialTimeout    = 10 * time.Second
+)
+
+var (
+	errRequestTooLarge   = errors.New("request headers too large")
+	errBadConnectRequest = errors.New("malformed CONNECT request")
+	logValueSanitizer    = strings.NewReplacer(
+		"\r", `\\r`,
+		"\n", `\\n`,
+	)
+)
+
+/* Create a server instance with TLS, authentication, and certificate settings. */
 func NewServer(serverPEM string, serverKEY string, clientPEM string, mtls bool, authUsers map[string]string) *Server {
 	return &Server{
 		serverPEM: serverPEM,
@@ -47,64 +65,57 @@ func NewServer(serverPEM string, serverKEY string, clientPEM string, mtls bool, 
 	}
 }
 
-/* handleClient processes a single client connection. */
+/* Process one client connection end to end. */
 func (s *Server) handleClient(conn net.Conn) {
-	/*
-	 * Capture client address early.
-	 * This ensures we have a stable string for logging even after connection closure.
-	 */
-	clientAddr := conn.RemoteAddr().String()
+	/* Capture client address early. */
+	clientAddr := sanitizeLogValue(conn.RemoteAddr().String())
 
 	/*
 	 * Ensure connection is closed and log disconnection.
 	 */
-	defer func() {
-		conn.Close()
-	}()
+	defer conn.Close()
 
 	/*
 	 * Perform TLS handshake manually.
-	 * This allows us to catch handshake errors (like EOF from scanners)
-	 * and verify the certificate without spamming logs.
+	 * This allows us to catch handshake errors and verify certificates without spamming logs.
 	 */
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
 		return
 	}
 
+	_ = tlsConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	if err := tlsConn.Handshake(); err != nil {
-		/* Specific check for mTLS client certificate errors. */
-		errMsg := err.Error()
-		if strings.Contains(errMsg, "unknown certificate") || strings.Contains(errMsg, "bad certificate") {
+		errMsg := strings.ToLower(err.Error())
+		if strings.Contains(errMsg, "unknown certificate") ||
+			strings.Contains(errMsg, "bad certificate") ||
+			strings.Contains(errMsg, "certificate required") {
 			log.Printf("[CERT-ERROR] %s: Client certificate rejected/missing", clientAddr)
-		} else if err != io.EOF && !strings.Contains(errMsg, "handshake failure") {
+		} else if !strings.Contains(errMsg, "handshake failure") && !strings.Contains(errMsg, "EOF") {
 			log.Printf("[TLS-ERROR] %s: %v", clientAddr, err)
 		}
 		return
 	}
+	_ = tlsConn.SetReadDeadline(time.Time{})
 
-	/* Use bufio to read the HTTP request line. */
-	reader := bufio.NewReader(conn)
-
-	reqLine, err := reader.ReadString('\n')
+	/* Parse CONNECT request and proxy auth header. */
+	_ = tlsConn.SetReadDeadline(time.Now().Add(requestReadTimeout))
+	reader := bufio.NewReaderSize(conn, requestHeaderLimit)
+	targetAddr, proxyAuth, err := readConnectRequest(reader)
+	_ = tlsConn.SetReadDeadline(time.Time{})
 	if err != nil {
+		switch {
+		case errors.Is(err, errRequestTooLarge):
+			_, _ = writeResponse(conn, "HTTP/1.1 413 Request Entity Too Large\r\n\r\n")
+		case errors.Is(err, errBadConnectRequest) || errors.Is(err, io.EOF):
+			_, _ = writeResponse(conn, "HTTP/1.1 400 Bad Request\r\n\r\n")
+		default:
+			log.Printf("[REQUEST-ERROR] %s: %v", clientAddr, err)
+			_, _ = writeResponse(conn, "HTTP/1.1 400 Bad Request\r\n\r\n")
+		}
 		return
 	}
-
-	/* Parse headers to extract Proxy-Authorization (case-insensitive). */
-	var proxyAuth string
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil || line == "\r\n" || line == "\n" {
-			break
-		}
-
-		/* Check for Proxy-Authorization header (case-insensitive). */
-		lowerLine := strings.ToLower(line)
-		if strings.HasPrefix(lowerLine, "proxy-authorization:") {
-			proxyAuth = strings.TrimSpace(line[len("proxy-authorization:"):])
-		}
-	}
+	targetAddrLog := sanitizeLogValue(targetAddr)
 
 	/* Validate auth if enabled. */
 	if len(s.authUsers) > 0 {
@@ -114,41 +125,31 @@ func (s *Server) handleClient(conn net.Conn) {
 			} else {
 				log.Printf("[AUTH-FAILED] %s: Invalid username or password", clientAddr)
 			}
-			conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"HProxy\"\r\n\r\n"))
+			_, _ = writeResponse(conn, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"HProxy\"\r\n\r\n")
 			return
 		}
 	}
 
-	/* Parse "CONNECT host:port HTTP/1.1" */
-	parts := strings.Split(strings.TrimSpace(reqLine), " ")
-	if len(parts) < 2 || parts[0] != "CONNECT" {
-		/* Not a CONNECT request. Return 400 Bad Request. */
-		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-		return
-	}
-
-	targetAddr := parts[1]
-
 	/* Dial the target. */
-	destConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	destConn, err := net.DialTimeout("tcp", targetAddr, targetDialTimeout)
 	if err != nil {
-		log.Printf("[DIAL-ERROR] %s -> %s: %v", clientAddr, targetAddr, err)
+		log.Printf("[DIAL-ERROR] %s -> %s: %v", clientAddr, targetAddrLog, err)
 		/* Reply 503 if dial fails */
-		conn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\n\r\n"))
+		_, _ = writeResponse(conn, "HTTP/1.1 503 Service Unavailable\r\n\r\n")
 		return
 	}
 	defer destConn.Close()
 
 	/* Reply 200 OK to establish the tunnel. */
-	_, err = conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	_, err = writeResponse(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 	if err != nil {
 		return
 	}
 
 	/* Log success. */
-	log.Printf("[CONNECT] %s -> %s", clientAddr, targetAddr)
+	log.Printf("[CONNECT] %s -> %s", clientAddr, targetAddrLog)
 
-	/* Track traffic stats atomically. */
+	/* Track traffic stats. */
 	var tx, rx int64
 
 	/* Start bidirectional transfer. */
@@ -167,7 +168,7 @@ func (s *Server) handleClient(conn net.Conn) {
 		}
 		/* Uplink: Client -> Target */
 		n, _ := Transfer(destConn, srcWrapper)
-		atomic.StoreInt64(&rx, n)
+		rx = n
 		destConn.Close()
 	}()
 
@@ -175,15 +176,23 @@ func (s *Server) handleClient(conn net.Conn) {
 		defer wg.Done()
 		/* Downlink: Target -> Client */
 		n, _ := Transfer(conn, destConn)
-		atomic.StoreInt64(&tx, n)
+		tx = n
 		conn.Close()
 	}()
 
 	wg.Wait()
-	log.Printf("[DISCONNECT] %s -> %s (Tx: %d, Rx: %d)", clientAddr, targetAddr, atomic.LoadInt64(&tx), atomic.LoadInt64(&rx))
+	log.Printf("[DISCONNECT] %s -> %s (Tx: %d, Rx: %d)", clientAddr, targetAddrLog, tx, rx)
 }
 
-/* validateAuth checks HTTP Basic Authentication credentials. */
+/* Write an HTTP response and return the first write error, if any. */
+func writeResponse(conn net.Conn, response string) (int, error) {
+	_ = conn.SetWriteDeadline(time.Now().Add(responseWriteTimeout))
+	wrote, err := conn.Write([]byte(response))
+	_ = conn.SetWriteDeadline(time.Time{})
+	return wrote, err
+}
+
+/* Verify an incoming Basic authorization header against configured credentials. */
 func (s *Server) validateAuth(authHeader string) bool {
 	if authHeader == "" {
 		return false
@@ -191,12 +200,12 @@ func (s *Server) validateAuth(authHeader string) bool {
 
 	/* Parse "Basic base64(username:password)" */
 	const prefix = "Basic "
-	if !strings.HasPrefix(authHeader, prefix) {
+	if len(authHeader) < len(prefix) || !strings.EqualFold(authHeader[:len(prefix)], prefix) {
 		return false
 	}
 
 	/* Decode Base64. */
-	encoded := strings.TrimPrefix(authHeader, prefix)
+	encoded := strings.TrimSpace(authHeader[len(prefix):])
 	decoded, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return false
@@ -215,8 +224,106 @@ func (s *Server) validateAuth(authHeader string) bool {
 	return exists && expectedPassword == password
 }
 
+/* Parse and validate the CONNECT request line and headers. */
+func readConnectRequest(reader *bufio.Reader) (string, string, error) {
+	readBytes := 0
+	nextLine := func() (string, error) {
+		line, n, err := readRequestLine(reader, requestHeaderLimit-readBytes)
+		readBytes += n
+		if readBytes > requestHeaderLimit {
+			return "", errRequestTooLarge
+		}
+		return line, err
+	}
+
+	requestLine, err := nextLine()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", "", errBadConnectRequest
+		}
+		return "", "", err
+	}
+	parts := strings.Fields(requestLine)
+	if len(parts) != 3 || parts[0] != "CONNECT" || !strings.HasPrefix(parts[2], "HTTP/") {
+		return "", "", errBadConnectRequest
+	}
+
+	targetAddr := parts[1]
+	if _, _, err := net.SplitHostPort(targetAddr); err != nil {
+		return "", "", errBadConnectRequest
+	}
+
+	var proxyAuth string
+	for {
+		line, err := nextLine()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return "", "", errBadConnectRequest
+			}
+			return "", "", err
+		}
+		if line == "" {
+			return targetAddr, proxyAuth, nil
+		}
+
+		headerName, headerValue, found := strings.Cut(line, ":")
+		if !found {
+			return "", "", errBadConnectRequest
+		}
+		headerName = strings.TrimSpace(headerName)
+		if strings.EqualFold(headerName, "Proxy-Authorization") {
+			proxyAuth = strings.TrimSpace(headerValue)
+		}
+	}
+}
+
+/* Read one request line with a hard size limit and return consumed bytes. */
+func readRequestLine(reader *bufio.Reader, limit int) (string, int, error) {
+	if limit <= 0 {
+		return "", 0, errRequestTooLarge
+	}
+
+	var builder strings.Builder
+	readBytes := 0
+
+	for {
+		part, err := reader.ReadSlice('\n')
+		readBytes += len(part)
+		if readBytes > limit {
+			return "", readBytes, errRequestTooLarge
+		}
+
+		builder.Write(part)
+		if err == nil {
+			line := builder.String()
+			line = strings.TrimSuffix(line, "\r\n")
+			line = strings.TrimSuffix(line, "\n")
+			return line, readBytes, nil
+		}
+
+		if errors.Is(err, io.EOF) {
+			return "", readBytes, io.EOF
+		}
+
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+
+		return "", readBytes, err
+	}
+}
+
+/* Escape newlines in log fields to protect parser safety. */
+func sanitizeLogValue(v string) string {
+	if !strings.ContainsAny(v, "\r\n") {
+		return v
+	}
+	return logValueSanitizer.Replace(v)
+}
+
+/* Start the TLS listener and serve CONNECT tunnels until shutdown. */
 func (s *Server) ListenAndServe(addr string) error {
-	/* Load keys and certs same as before... */
+	/* Load keys and certificates for server-side TLS. */
 	cert, err := tls.LoadX509KeyPair(s.serverPEM, s.serverKEY)
 	if err != nil {
 		return errors.New("failed to load server certificate and key: " + err.Error())
@@ -253,34 +360,44 @@ func (s *Server) ListenAndServe(addr string) error {
 		return err
 	}
 
-	log.Printf("[SYSTEM] Server listening on %s (mTLS Enabled)", addr)
-
-	/* Setup graceful shutdown. */
+	/* Setup graceful shutdown via SIGINT/SIGTERM. */
+	shutdown := make(chan struct{})
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
-		log.Println("[SYSTEM] Received shutdown signal, closing listener...")
-		listener.Close()
+		defer signal.Stop(sigChan)
+
+		select {
+		case <-sigChan:
+			log.Println("[SYSTEM] Received shutdown signal, closing listener...")
+			_ = listener.Close()
+		case <-shutdown:
+		}
 	}()
+	defer close(shutdown)
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			/* Check if it's a shutdown-induced error. */
-			if strings.Contains(err.Error(), "use of closed network connection") {
+			if errors.Is(err, net.ErrClosed) {
 				log.Println("[SYSTEM] Server shutdown complete.")
 				return nil
 			}
+
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				log.Printf("[SYSTEM] Temporary accept error: %v", err)
+				continue
+			}
+
 			log.Printf("[SYSTEM] Accept error: %v", err)
-			continue
+			return err
 		}
 
 		go s.handleClient(conn)
 	}
 }
 
-/* Helper to adapt bufio.Reader to net.Conn for Transfer */
+/* Adapt a buffered reader into a net.Conn-compatible source type. */
 type ReaderConn struct {
 	io.Reader
 	net.Conn
@@ -288,6 +405,22 @@ type ReaderConn struct {
 
 func (r ReaderConn) Read(p []byte) (n int, err error) {
 	return r.Reader.Read(p)
+}
+
+func validateConfig(config Config) error {
+	if config.ListenAddr == "" {
+		return errors.New("listen_addr is required")
+	}
+	if config.ServerPEM == "" {
+		return errors.New("server_pem is required")
+	}
+	if config.ServerKey == "" {
+		return errors.New("server_key is required")
+	}
+	if config.MTLS != nil && *config.MTLS && config.ClientPEM == "" {
+		return errors.New("client_pem is required when mtls is enabled")
+	}
+	return nil
 }
 
 func main() {
@@ -303,6 +436,10 @@ func main() {
 	var config Config
 	if err := json.Unmarshal(bytes, &config); err != nil {
 		log.Fatalf("Failed to parse configuration file: %v", err)
+	}
+
+	if err := validateConfig(config); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
 	}
 
 	mtlsEnabled := true

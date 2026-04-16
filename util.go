@@ -73,12 +73,16 @@ func Transfer(dst net.Conn, src net.Conn) (int64, error) {
 			offset := 0
 			for offset < n {
 				nw, wErr := dst.Write(buf[offset:n])
-				if wErr != nil {
-					return written, wErr
-				} else if nw > 0 {
+				if nw > 0 {
 					written += int64(nw)
 					offset += nw
-				} else if nw == 0 {
+				}
+
+				if wErr != nil {
+					return written, wErr
+				}
+
+				if nw == 0 {
 					/* Zero write without error is unusual, treat as stall. */
 					return written, io.ErrShortWrite
 				}

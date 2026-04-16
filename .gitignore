@@ -20,6 +20,9 @@ hproxy-server.exe
 .DS_Store
 Thumbs.db
 
+# Tooling/runtime state
+.omx/
+
 # Go
 *.test
 *.out

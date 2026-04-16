@@ -20,7 +20,7 @@ This tool is suitable for zero-trust network access, secure internal infrastruct
 - **Standard Compliant**: Full support for RFC 7231 HTTP/1.1 `CONNECT` tunneling.
 - **Secure by Design**: Optional mTLS authentication + mandatory/optional HTTP Basic Auth.
 - **Minimalist**: Single binary, zero dependencies, built on Go standard library.
-- **Production Ready**: OOM protection, graceful shutdown, atomic counters.
+- **Production Ready**: OOM protection, graceful shutdown, safe concurrent traffic accounting.
 
 ## Quick Start
 
