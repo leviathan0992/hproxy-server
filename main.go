@@ -417,7 +417,11 @@ func validateConfig(config Config) error {
 	if config.ServerKey == "" {
 		return errors.New("server_key is required")
 	}
-	if config.MTLS != nil && *config.MTLS && config.ClientPEM == "" {
+	mtlsEnabled := true
+	if config.MTLS != nil {
+		mtlsEnabled = *config.MTLS
+	}
+	if mtlsEnabled && config.ClientPEM == "" {
 		return errors.New("client_pem is required when mtls is enabled")
 	}
 	return nil

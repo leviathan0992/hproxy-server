@@ -163,6 +163,30 @@ func TestValidateConfigRejectsMissingListenAddr(t *testing.T) {
 	}
 }
 
+/* Enforce the documented default of mtls=true at config-validation time. */
+func TestValidateConfigRejectsMissingClientPEMWhenMTLSDefaultsEnabled(t *testing.T) {
+	if err := validateConfig(Config{
+		ListenAddr: "0.0.0.0:443",
+		ServerPEM:  "server.crt",
+		ServerKey:  "server.key",
+	}); err == nil || err.Error() != "client_pem is required when mtls is enabled" {
+		t.Fatalf("expected client_pem validation error, got %v", err)
+	}
+}
+
+/* Allow missing client CA material only when mtls is explicitly disabled. */
+func TestValidateConfigAllowsMissingClientPEMWhenMTLSDisabled(t *testing.T) {
+	mtlsDisabled := false
+	if err := validateConfig(Config{
+		ListenAddr: "0.0.0.0:443",
+		ServerPEM:  "server.crt",
+		ServerKey:  "server.key",
+		MTLS:       &mtlsDisabled,
+	}); err != nil {
+		t.Fatalf("expected config to be valid when mtls is disabled, got %v", err)
+	}
+}
+
 type testConn struct {
 	readData  []byte
 	readPos   int
